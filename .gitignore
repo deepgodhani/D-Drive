@@ -1,0 +1,26 @@
+# Build directory
+/build/
+client_secret.json
+
+# User-specific files
+*.user
+*.suo
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Libraries
+*.lib
+*.dll
+*.so
+*.a
+
+# Data directory (optional, if you don't want to track chunks)
+/data/
+*.avi
+*.mp4
+*.mkv
+# Logs
+*.log
