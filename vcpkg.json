@@ -3,6 +3,8 @@
   "version-string": "1.0.0",
   "dependencies": [
     "cpr",
-    "nlohmann-json"
+    "nlohmann-json",
+    "indicators",
+    "cpp-httplib"
   ]
 }
