@@ -12,12 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(cpr REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(indicators REQUIRED)
-find_package(httplib REQUIRED) # Find the new web server library
+find_package(httplib REQUIRED)# Find the new progress bar library
 
 
 # --- Configure the Executable ---
 set(SOURCES
     src/main.cpp
+    src/Shell.cpp
+    src/Shell.h
     src/gdrive_handler.cpp
     src/gdrive_handler.h
 )
@@ -27,9 +29,9 @@ add_executable(filesplitter ${SOURCES})
 target_link_libraries(filesplitter PRIVATE
     cpr::cpr
     nlohmann_json::nlohmann_json
-    indicators::indicators
-    httplib::httplib # Link the new web server library
-)
+    indicators::indicators # Link the new progress bar library
+    httplib::httplib
+    )
 
 # --- Installation (Optional but good practice) ---
 install(TARGETS filesplitter DESTINATION bin)

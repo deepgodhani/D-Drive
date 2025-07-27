@@ -1,10 +1,10 @@
 {
-  "name": "gdrive-splitter",
-  "version-string": "1.0.0",
+  "name": "d-drive",
+  "version-string": "0.1.0",
   "dependencies": [
-    "cpr",
-    "nlohmann-json",
-    "indicators",
-    "cpp-httplib"
+      "cpr",
+      "nlohmann-json",
+      "indicators",
+      "cpp-httplib"
   ]
 }
