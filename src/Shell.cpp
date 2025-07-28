@@ -1,371 +1,313 @@
 #include "Shell.h"
 #include <iostream>
+#include <fstream>
 #include <sstream>
-#include <filesystem>
-#include <stdexcept>
-#include <algorithm>
 #include <iomanip>
+#include <filesystem>
+#include <thread>
+#include <future>
+#include <iterator>
+#include <algorithm>
+#include <chrono>
 #include <indicators/progress_bar.hpp>
 #include <indicators/cursor_control.hpp>
 
 namespace fs = std::filesystem;
-using namespace indicators;
 
-// =============================================================================
-// UTILITY FUNCTIONS (MOVED TO THE TOP)
-// =============================================================================
+Shell::Shell()
+    : m_creds_path("data/credentials/credentials.json"),
+      m_metadata_changed(false),
+      m_upload_slots(8)
+{
+    initializeState();
 
-// This function's full body must be defined before it is used because it returns 'auto'.
-auto create_progress_callback(ProgressBar& bar) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-    return [&](cpr::cpr_off_t total, cpr::cpr_off_t now, cpr::cpr_off_t, cpr::cpr_off_t, intptr_t) -> bool {
-        if (total == 0) return true;
-        auto now_time = std::chrono::high_resolution_clock::now();
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - start_time).count();
-        float speed_mbps = (duration_ms > 500) ? (static_cast<float>(now) / (1024 * 1024)) / (static_cast<float>(duration_ms) / 1000.0f) : 0.0f;
-        float percentage = (static_cast<float>(now) / static_cast<float>(total)) * 100.0f;
-        bar.set_progress(static_cast<size_t>(percentage));
-
-        std::stringstream postfix_ss;
-        postfix_ss << std::to_string(now / (1024 * 1024)) << "/" << std::to_string(total / (1024 * 1024)) << " MB | ";
-        postfix_ss << std::fixed << std::setprecision(2) << speed_mbps << " MB/s | ";
-        if (speed_mbps > 0.01) {
-            float eta_seconds = (static_cast<float>(total - now)) / (speed_mbps * 1024 * 1024);
-            postfix_ss << "ETA: " << std::fixed << std::setprecision(1) << eta_seconds << "s";
-        } else {
-            postfix_ss << "ETA: inf";
-        }
-        bar.set_option(option::PostfixText{postfix_ss.str()});
-        return true;
+    m_commands = {
+        {"add-account", {"Add a new Google Drive account", [this](const auto& args) { addAccount(args); }}},
+        {"upload", {"Upload a file", [this](const auto& args) { uploadFile(args); }}},
+        {"download", {"Download a file", [this](const auto& args) { downloadFile(args); }}},
+        {"list", {"List uploaded files", [this](const auto& args) { listFiles(args); }}},
+        {"accounts", {"List connected accounts", [this](const auto& args) { listAccounts(args); }}},
+        {"help", {"Show help", [this](const auto& args) { showHelp(args); }}}
     };
 }
 
-std::string getOrCreateFolder(GDriveHandler& gdrive, const std::string& folderName, const std::string& parentId = "root") {
-    std::string folderId = gdrive.findFileOrFolder(folderName, parentId);
-    if (folderId.empty()) {
-        std::cout << "Folder '" << folderName << "' not found, creating..." << std::endl;
-        folderId = gdrive.createFolder(folderName, parentId);
-    }
-    return folderId;
-}
-
-int getPartNumber(const fs::path& path) {
-    std::string filename = path.filename().string();
-    size_t pos = filename.rfind(".part");
-    if (pos != std::string::npos) {
-        try {
-            return std::stoi(filename.substr(pos + 5));
-        } catch (...) {}
-    }
-    return -1;
-}
-
-void splitFile(const std::string& inputFilePath, const std::string& outputDir, long long chunkSize) {
-    std::ifstream inputFile(inputFilePath, std::ios::binary);
-    if (!inputFile) throw std::runtime_error("Cannot open input file for splitting: " + inputFilePath);
-    
-    std::vector<char> buffer(chunkSize);
-    int chunkNumber = 1;
-    while (inputFile) {
-        inputFile.read(buffer.data(), chunkSize);
-        std::streamsize bytesRead = inputFile.gcount();
-        if (bytesRead > 0) {
-            std::ofstream outputFile(
-                fs::path(outputDir) / (fs::path(inputFilePath).filename().string() + ".part" + std::to_string(chunkNumber++)),
-                std::ios::binary
-            );
-            outputFile.write(buffer.data(), bytesRead);
+void Shell::run() {
+    std::cout << "Welcome to D-Drive CLI\nType 'help' to list available commands\n";
+    std::string input;
+    while (true) {
+        std::cout << ">> ";
+        std::getline(std::cin, input);
+        auto tokens = parseCommand(input);
+        if (tokens.empty()) continue;
+        std::string cmd = tokens[0];
+        if (cmd == "exit") break;
+        auto it = m_commands.find(cmd);
+        if (it != m_commands.end()) {
+            try {
+                it->second.handler(tokens);
+            } catch (const std::exception& e) {
+                std::cerr << "Error: " << e.what() << std::endl;
+            }
+        } else {
+            std::cerr << "Unknown command: " << cmd << std::endl;
         }
     }
+    saveMetadataOnExit();
 }
 
-void mergeFiles(const std::string& inputDir, const std::string& outputFilePath) {
-    std::vector<fs::path> chunkFiles;
-    for (const auto& entry : fs::directory_iterator(inputDir)) {
-        if (entry.is_regular_file()) chunkFiles.push_back(entry.path());
+void Shell::uploadFile(const std::vector<std::string>& args) {
+    if (args.size() < 2)
+        throw std::runtime_error("Usage: upload <file_path>");
+    uploadFile(args[1]);
+}
+
+void Shell::uploadFile(const std::string& localFilePath) {
+    std::ifstream file(localFilePath, std::ios::binary | std::ios::ate);
+    if (!file)
+        throw std::runtime_error("Cannot open file: " + localFilePath);
+
+    std::streamsize fileSize = file.tellg();
+    file.seekg(0);
+    const int64_t chunkSize = 50 * 1024 * 1024;
+    int totalChunks = (fileSize + chunkSize - 1) / chunkSize;
+
+    std::string fileName = fs::path(localFilePath).filename().string();
+    std::string metadataKey = fileName;
+
+    if (m_local_accounts.empty())
+        throw std::runtime_error("No linked accounts. Use 'add-account' first.");
+    if (m_local_accounts.size() > 1 && !m_primary_gdrive) {
+        throw std::runtime_error("Primary account not set for sharing. Please restart the app.");
     }
-    std::sort(chunkFiles.begin(), chunkFiles.end(), [](const fs::path& a, const fs::path& b) {
-        return getPartNumber(a) < getPartNumber(b);
-    });
 
-    std::ofstream outputFile(outputFilePath, std::ios::binary);
-    if (!outputFile) throw std::runtime_error("Cannot open output file for merging: " + outputFilePath);
+    // --- FIX FOR RACE CONDITION ---
+    // 1. Create the main folder with the primary account
+    std::string chunksParentFolder = m_primary_gdrive->createFolder("D-DriveChunks");
+    std::string fileParentFolderId = m_primary_gdrive->createFolder(fileName, chunksParentFolder);
+    m_metadata["files"][metadataKey]["parent_folder_id"] = fileParentFolderId;
+    m_metadata["files"][metadataKey]["total_size"] = fileSize;
 
-    std::vector<char> buffer(4 * 1024 * 1024);
-    for (const auto& chunkPath : chunkFiles) {
-        std::ifstream inputFile(chunkPath, std::ios::binary);
-        while (inputFile) {
-            inputFile.read(buffer.data(), buffer.size());
-            std::streamsize bytesRead = inputFile.gcount();
-            if (bytesRead > 0) outputFile.write(buffer.data(), bytesRead);
+    // 2. Share this folder with all other accounts
+    if (m_local_accounts.size() > 1) {
+        for (const auto& [email, _] : m_local_accounts) {
+            // Don't need to share with the owner
+            if (email != m_primary_gdrive->getAccessToken()) {
+                 m_primary_gdrive->shareFileOrFolder(fileParentFolderId, email);
+            }
         }
     }
+    // --- END FIX ---
+
+    std::mutex meta_mutex;
+    std::mutex progress_mutex;
+    std::atomic<long long> uploaded_bytes = 0;
+    std::atomic<int> successful_chunks = 0;
+    std::vector<std::future<void>> futures;
+
+    indicators::ProgressBar bar{
+        indicators::option::BarWidth{50},
+        indicators::option::Start{"["},
+        indicators::option::Fill{"="},
+        indicators::option::Lead{">"},
+        indicators::option::Remainder{" "},
+        indicators::option::End{"]"},
+        indicators::option::MaxProgress{static_cast<size_t>(fileSize)},
+        indicators::option::ShowPercentage{true},
+        indicators::option::ShowElapsedTime{true},
+        indicators::option::ShowRemainingTime{true}
+    };
+    
+    indicators::show_console_cursor(false);
+    auto start_time = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < totalChunks; ++i) {
+        int64_t thisChunkSize = std::min(chunkSize, fileSize - (i * chunkSize));
+        std::vector<char> buffer(thisChunkSize);
+        file.read(buffer.data(), thisChunkSize);
+
+        std::string chunkFilePath = "data/" + fileName + ".part" + std::to_string(i);
+        std::ofstream chunkFile(chunkFilePath, std::ios::binary);
+        chunkFile.write(buffer.data(), thisChunkSize);
+        chunkFile.close();
+
+        auto account_it = std::next(m_local_accounts.begin(), i % m_local_accounts.size());
+        std::string account = account_it->first;
+        std::string tokenPath = account_it->second;
+
+        m_upload_slots.acquire();
+        futures.emplace_back(std::async(std::launch::async, [this, tokenPath, chunkFilePath, fileName, i, fileParentFolderId, &bar, &uploaded_bytes, &meta_mutex, &progress_mutex, &successful_chunks, account, metadataKey, &start_time] {
+            try {
+                GDriveHandler gdrive(tokenPath, m_creds_path);
+                gdrive.ensureAuthenticated();
+                
+                cpr::cpr_off_t chunk_uploaded = 0;
+
+                std::string fileId = gdrive.uploadChunk(
+                    chunkFilePath,
+                    fileName + ".part" + std::to_string(i),
+                    fileParentFolderId, // Use the pre-created, shared folder
+                    [&](cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t now_ul, intptr_t) -> bool {
+                        cpr::cpr_off_t delta = now_ul - chunk_uploaded;
+                        chunk_uploaded = now_ul;
+                        uploaded_bytes += delta;
+
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                        if (elapsed_seconds > 0) {
+                            double speed = (double)uploaded_bytes / elapsed_seconds;
+                            std::stringstream speed_ss;
+                            if (speed < 1024 * 1024) {
+                                speed_ss << std::fixed << std::setprecision(1) << (speed / 1024.0) << " KB/s";
+                            } else {
+                                speed_ss << std::fixed << std::setprecision(1) << (speed / (1024.0 * 1024.0)) << " MB/s";
+                            }
+                            bar.set_option(indicators::option::PostfixText{speed_ss.str()});
+                        }
+                        bar.set_progress(uploaded_bytes);
+                        return true;
+                    });
+
+                {
+                    std::lock_guard<std::mutex> lock(meta_mutex);
+                    m_metadata["files"][metadataKey]["chunks"].push_back({
+                        {"part", i},
+                        {"account", account},
+                        {"drive_file_id", fileId}
+                    });
+                }
+                successful_chunks++;
+                fs::remove(chunkFilePath);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                std::cerr << "\nError uploading chunk " << i << ": " << e.what() << std::endl;
+            }
+            m_upload_slots.release();
+        }));
+    }
+
+    for (auto& f : futures) {
+        f.get();
+    }
+    
+    indicators::show_console_cursor(true);
+    
+    // --- FIX FOR PROGRESS BAR SPAM ---
+    // Only update and finalize the bar once, after all threads are done.
+    if (successful_chunks == totalChunks) {
+        bar.set_option(indicators::option::PostfixText{"Upload Complete!"});
+        if(!bar.is_completed()) bar.mark_as_completed();
+        std::cout << "\nFile uploaded successfully. Metadata saved." << std::endl;
+    } else {
+        bar.set_option(indicators::option::PostfixText{"Upload Failed!"});
+        if(!bar.is_completed()) bar.mark_as_completed();
+        std::cerr << "\nUpload failed. " << successful_chunks << "/" << totalChunks << " chunks were successful." << std::endl;
+    }
+    // --- END FIX ---
+    
+    std::ofstream out("data/metadata.json");
+    out << m_metadata.dump(4);
 }
 
-// =============================================================================
-// SHELL CLASS IMPLEMENTATION
-// =============================================================================
+void Shell::downloadFile(const std::vector<std::string>& args) {
+    if (args.size() < 3)
+        throw std::runtime_error("Usage: download <remote_file_name> <save_as_path>");
 
-Shell::Shell() : m_metadata_changed(false) {
-    m_commands["add-account"] = {"Link a new Google Drive account.", [this](const auto& args){ this->addAccount(args); }};
-    m_commands["upload"] = {"Uploads and splits a file.", [this](const auto& args){ this->uploadFile(args); }};
-    m_commands["download"] = {"Downloads and merges a file.", [this](const auto& args){ this->downloadFile(args); }};
-    m_commands["ls"] = {"List all managed files.", [this](const auto& args){ this->listFiles(args); }};
-    m_commands["list-files"] = {"(Alias for ls)", [this](const auto& args){ this->listFiles(args); }};
-    m_commands["list-accounts"] = {"List linked accounts and usage.", [this](const auto& args){ this->listAccounts(args); }};
-    m_commands["help"] = {"Show this help message.", [this](const auto& args){ this->showHelp(args); }};
-    
-    m_creds_path = "data/credentials/credentials.json";
+    std::string remoteFileName = args[1];
+    std::string savePath = args[2];
+
+    if (!m_metadata["files"].contains(remoteFileName))
+        throw std::runtime_error("No metadata found for: " + remoteFileName);
+
+    const auto& fileMeta = m_metadata["files"][remoteFileName];
+    const auto& chunks = fileMeta["chunks"];
+
+    std::string tempDir = "./temp_chunks_download";
+    if (fs::exists(tempDir)) fs::remove_all(tempDir);
+    fs::create_directories(tempDir);
+
+    std::vector<std::thread> threads;
+    for (const auto& chunk : chunks) {
+        threads.emplace_back([&, chunk]() {
+            std::string account = chunk["account"];
+            std::string file_id = chunk["drive_file_id"];
+            int part = chunk["part"];
+            std::string token_path = m_local_accounts[account];
+            std::string chunkPath = (fs::path(tempDir) / (remoteFileName + ".part" + std::to_string(part))).string();
+
+            GDriveHandler gdrive(token_path, m_creds_path);
+            gdrive.downloadChunk(file_id, chunkPath, nullptr);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+
+    std::ofstream out(savePath, std::ios::binary);
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        std::string partPath = (fs::path(tempDir) / (remoteFileName + ".part" + std::to_string(i))).string();
+        std::ifstream in(partPath, std::ios::binary);
+        out << in.rdbuf();
+        in.close();
+    }
+    out.close();
+    fs::remove_all(tempDir);
+
+    std::cout << "✅ Download completed to: " << savePath << std::endl;
+}
+
+void Shell::listFiles(const std::vector<std::string>&) {
+    std::cout << "--- Uploaded Files ---\n";
+    for (const auto& [key, value] : m_metadata["files"].items()) {
+        std::cout << key << " (" << value["chunks"].size() << " chunks)\n";
+    }
 }
 
 void Shell::initializeState() {
-    const std::string metadataFilePath = "data/metadata.json";
-
-    // Load metadata from local file
-    if (fs::exists(metadataFilePath)) {
-        std::ifstream metadataFile(metadataFilePath);
-        if (metadataFile.is_open()) {
-            m_metadata = json::parse(metadataFile);
-            std::cout << "Loaded metadata from local storage." << std::endl;
-        } else {
-            throw std::runtime_error("Failed to open metadata file: " + metadataFilePath);
-        }
-    } else {
-        std::cout << "No local metadata found. Initializing new metadata." << std::endl;
-        m_metadata = {{"accounts", json::object()}, {"files", json::object()}};
+    if (fs::exists("data/metadata.json")) {
+        std::ifstream in("data/metadata.json");
+        in >> m_metadata;
     }
-
-    // Load local accounts
-    if (fs::exists("data/tokens")) {
-        for (const auto& entry : fs::directory_iterator("data/tokens")) {
-            if (entry.is_regular_file()) {
-                m_local_accounts[entry.path().stem().string()] = entry.path().string();
-            }
-        }
+    for (const auto& file : fs::directory_iterator("data/tokens")) {
+        std::string email = file.path().stem().string();
+        m_local_accounts[email] = file.path().string();
     }
-
-    // Ensure a primary account exists
-    if (m_local_accounts.empty()) {
-        std::cout << "No accounts found. Please add a primary account to begin." << std::endl;
-        std::cout << "Use the command: add-account <email>" << std::endl;
-
-        std::string line;
-        while (true) {
-            std::cout << "\ngdrive > ";
-            if (!std::getline(std::cin, line) || line == "exit" || line == "quit") {
-                throw std::runtime_error("Application cannot proceed without a primary account.");
-            }
-
-            auto args = parseCommand(line);
-            if (args.empty() || args[0] != "add-account") {
-                std::cerr << "Invalid command. Please use 'add-account <email>' to add a primary account." << std::endl;
-                continue;
-            }
-
-            try {
-                addAccount(args);
-                break; // Exit the loop once the primary account is added
-            } catch (const std::exception& e) {
-                std::cerr << "Error: " << e.what() << std::endl;
-            }
-        }
+    if (!m_local_accounts.empty()) {
+        auto const& [email, path] = *m_local_accounts.begin();
+        m_primary_gdrive = std::make_unique<GDriveHandler>(path, m_creds_path);
     }
-}
-
-void Shell::run() {
-    initializeState();
-    std::string line;
-    std::cout << "\n--- GDrive Splitter Shell (v2.0) ---" << std::endl;
-    showHelp({});
-
-    while (true) {
-        std::cout << "\ngdrive > ";
-        if (!std::getline(std::cin, line) || line == "exit" || line == "quit") break;
-        
-        auto args = parseCommand(line);
-        if (args.empty()) continue;
-
-        auto const& command_name = args[0];
-        auto const it = m_commands.find(command_name);
-
-        if (it == m_commands.end()) {
-            std::cerr << "Unknown command: '" << command_name << "'. Type 'help' for a list of commands." << std::endl;
-        } else {
-            try {
-                it->second.handler(args);
-            } catch (const std::exception& e) {
-                std::cerr << "Error: " << e.what() << std::endl;
-                // Clean up temp directories in case of error during upload/download
-                if (fs::exists("./temp_chunks_upload")) fs::remove_all("./temp_chunks_upload");
-                if (fs::exists("./temp_chunks_download")) fs::remove_all("./temp_chunks_download");
-            }
-        }
-    }
-    
-    saveMetadataOnExit();
-    std::cout << "Exiting." << std::endl;
 }
 
 void Shell::saveMetadataOnExit() {
-    if (m_metadata_changed && m_primary_gdrive) {
-        std::cout << "Saving updated metadata to primary drive..." << std::endl;
-        std::string metadataFileId = m_primary_gdrive->findFileOrFolder("gdrive_splitter_metadata.json");
-        if (metadataFileId.empty()) {
-            m_primary_gdrive->uploadNewFile(m_metadata.dump(4), "gdrive_splitter_metadata.json");
-        } else {
-            m_primary_gdrive->updateFileContent(metadataFileId, m_metadata.dump(4));
-        }
-        std::cout << "Metadata saved successfully." << std::endl;
+    if (m_metadata_changed) {
+        std::ofstream out("data/metadata.json");
+        out << m_metadata.dump(4);
     }
 }
 
 std::vector<std::string> Shell::parseCommand(const std::string& input) {
-    std::stringstream ss(input);
-    std::string segment;
-    std::vector<std::string> seglist;
-    while (ss >> segment) seglist.push_back(segment);
-    return seglist;
+    std::istringstream iss(input);
+    return {std::istream_iterator<std::string>{iss}, std::istream_iterator<std::string>{}};
 }
 
-// --- COMMAND HANDLER IMPLEMENTATIONS ---
-
-void Shell::showHelp(const std::vector<std::string>& args) {
-    std::cout << "Available commands:" << std::endl;
-    for (const auto& pair : m_commands) {
-        if (pair.second.description.find("Alias") == std::string::npos) {
-             std::cout << "  " << std::left << std::setw(20) << pair.first << pair.second.description << std::endl;
-        }
-    }
+void Shell::addAccount(const std::vector<std::string>&) {
+    std::cout << "Adding new account...\n";
+    GDriveHandler handler("", m_creds_path);
+    auto email = handler.authenticateNewAccount("data/tokens");
+    m_local_accounts[email] = "data/tokens/" + email + ".json";
+    if (!m_primary_gdrive)
+        m_primary_gdrive = std::make_unique<GDriveHandler>(m_local_accounts[email], m_creds_path);
+    std::cout << "Account added: " << email << std::endl;
 }
 
-void Shell::addAccount(const std::vector<std::string>& args) {
-    if (args.size() < 2) throw std::runtime_error("Usage: add-account <user_email>");
-    std::string email = args[1];
-    std::string tokenPath = "data/tokens/" + email + ".json";
-
-    GDriveHandler gdrive(tokenPath, m_creds_path);
-    gdrive.ensureAuthenticated();
-    std::cout << "Successfully added account: " << email << std::endl;
-
-    if (!m_metadata["accounts"].contains(email)) {
-        m_metadata["accounts"][email] = {
-            {"token_path", tokenPath},
-            {"total_space", 15LL * 1024 * 1024 * 1024},
-            {"used_space", 0}
-        };
-        m_metadata_changed = true;
-        std::cout << "Account added to local metadata." << std::endl;
-    }
+void Shell::listAccounts(const std::vector<std::string>&) {
+    std::cout << "Connected accounts:\n";
+    for (const auto& [email, _] : m_local_accounts)
+        std::cout << "- " << email << std::endl;
 }
 
-void Shell::uploadFile(const std::vector<std::string>& args) {
-    if (args.size() < 2) throw std::runtime_error("Usage: upload <path_to_file>");
-
-    std::string localFilePath = args[1];
-    std::string remoteFileName = fs::path(localFilePath).filename().string();
-    if (m_metadata["files"].contains(remoteFileName)) {
-        throw std::runtime_error("File with this name already exists in metadata. Please choose a different name or delete the existing one first.");
-    }
-
-    const std::string tempChunkDir = "./temp_chunks_upload";
-    if (fs::exists(tempChunkDir)) fs::remove_all(tempChunkDir);
-    fs::create_directories(tempChunkDir);
-
-    splitFile(localFilePath, tempChunkDir, 50 * 1024 * 1024);
-
-    std::vector<fs::path> chunks;
-    for (const auto& entry : fs::directory_iterator(tempChunkDir)) chunks.push_back(entry.path());
-    std::sort(chunks.begin(), chunks.end(), [](const fs::path& a, const fs::path& b) {
-        return getPartNumber(a) < getPartNumber(b);
-    });
-
-    int part = 1;
-    for (const auto& chunk_path : chunks) {
-        bool uploaded = false;
-        for (auto& acc : m_metadata["accounts"].items()) {
-            if ((acc.value()["total_space"].get<long long>() - acc.value()["used_space"].get<long long>()) > fs::file_size(chunk_path)) {
-                GDriveHandler gdrive(acc.value()["token_path"], m_creds_path);
-
-                std::string fileId = gdrive.uploadChunk(chunk_path.string(), chunk_path.filename().string(), "root");
-
-                m_metadata["files"][remoteFileName]["chunks"].push_back({
-                    {"part", part}, {"account", acc.key()}, {"drive_file_id", fileId}
-                });
-                acc.value()["used_space"] = acc.value()["used_space"].get<long long>() + fs::file_size(chunk_path);
-                uploaded = true;
-                break;
-            }
-        }
-        if (!uploaded) {
-            throw std::runtime_error("Upload failed! Not enough space on any account for chunk " + std::to_string(part));
-        }
-        part++;
-    }
-
-    m_metadata["files"][remoteFileName]["total_size"] = fs::file_size(localFilePath);
-    fs::remove_all(tempChunkDir);
-    std::cout << "File upload finished." << std::endl;
-    m_metadata_changed = true;
-}
-
-
-void Shell::downloadFile(const std::vector<std::string>& args) {
-    if (args.size() < 3) throw std::runtime_error("Usage: download <remote_file_name> <save_as_path>");
-
-    std::string remoteFileName = args[1];
-    std::string savePath = args[2];
-    if (!m_metadata["files"].contains(remoteFileName)) throw std::runtime_error("File not found in metadata.");
-
-    const std::string tempChunkDir = "./temp_chunks_download";
-    if (fs::exists(tempChunkDir)) fs::remove_all(tempChunkDir);
-    fs::create_directories(tempChunkDir);
-
-    int total_chunks = m_metadata["files"][remoteFileName]["chunks"].size();
-    std::vector<std::thread> threads;
-
-    for (const auto& chunk : m_metadata["files"][remoteFileName]["chunks"]) {
-        threads.emplace_back([&, chunk]() {
-            std::string account = chunk["account"];
-            std::string file_id = chunk["drive_file_id"];
-            std::string chunk_save_path = (fs::path(tempChunkDir) / (remoteFileName + ".part" + std::to_string(chunk["part"].get<int>()))).string();
-
-            GDriveHandler gdrive(m_metadata["accounts"][account]["token_path"], m_creds_path);
-
-            gdrive.downloadChunk(file_id, chunk_save_path);
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    mergeFiles(tempChunkDir, savePath);
-    fs::remove_all(tempChunkDir);
-    std::cout << "File download completed! Saved to " << savePath << std::endl;
-}
-
-void Shell::listFiles(const std::vector<std::string>& args) {
-    if (!m_primary_gdrive) throw std::runtime_error("No primary account set. Please add one first.");
-    std::cout << "--- Managed Files ---" << std::endl;
-    if (m_metadata.value("files", json::object()).empty()) {
-        std::cout << "No files are currently managed." << std::endl;
-    } else {
-        for (const auto& file : m_metadata.value("files", json::object()).items()) {
-            long long size_mb = file.value()["total_size"].get<long long>() / (1024 * 1024);
-            std::cout << "- " << file.key() << " (" << size_mb << " MB)" << std::endl;
-        }
-    }
-}
-
-void Shell::listAccounts(const std::vector<std::string>& args) {
-    std::cout << "--- Linked Accounts ---" << std::endl;
-    if (m_metadata["accounts"].empty()) {
-        std::cout << "No accounts are currently linked." << std::endl;
-    } else {
-        for (const auto& acc : m_metadata["accounts"].items()) {
-            long long used_mb = acc.value()["used_space"].get<long long>() / (1024 * 1024);
-            long long total_mb = acc.value()["total_space"].get<long long>() / (1024 * 1024);
-            std::cout << "- " << acc.key() << " | " << used_mb << " / " << total_mb << " MB used." << std::endl;
-        }
-    }
+void Shell::showHelp(const std::vector<std::string>&) {
+    std::cout << "Available commands:\n";
+    for (const auto& [cmd, info] : m_commands)
+        std::cout << std::setw(12) << std::left << cmd << " : " << info.description << std::endl;
+    std::cout << "Type 'exit' to quit.\n";
 }

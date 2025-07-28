@@ -13,17 +13,21 @@ class GDriveHandler {
 public:
     GDriveHandler(const std::string& token_path, const std::string& credentials_path);
     void ensureAuthenticated();
+    std::string authenticateNewAccount(const std::string& token_directory);
 
     // --- Cloud Metadata Functions ---
     std::string findFileOrFolder(const std::string& name, const std::string& parent_id = "root");
     std::string createFolder(const std::string& name, const std::string& parent_id = "root");
+    void shareFileOrFolder(const std::string& fileId, const std::string& emailAddress); // <-- ADD THIS LINE
     std::string uploadNewFile(const std::string& content, const std::string& remote_name, const std::string& parent_id = "root");
     void updateFileContent(const std::string& file_id, const std::string& content);
     std::string downloadFileContent(const std::string& file_id);
-
+    std::string getAccessToken() const;
     // --- Chunk Transfer Functions (Now with Progress) ---
     std::string uploadChunk(const std::string& local_file_path, const std::string& remote_file_name, const std::string& parentFolderId, const ProgressCallback& progress_callback = nullptr);
     void downloadChunk(const std::string& file_id, const std::string& save_path, const ProgressCallback& progress_callback = nullptr);
+
+    std::string extractUploadedFileId(const cpr::Response& response);
 
 private:
     void performAuthentication();

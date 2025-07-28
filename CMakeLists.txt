@@ -25,11 +25,14 @@ set(SOURCES
 )
 add_executable(filesplitter ${SOURCES})
 
+# Add this line to prevent min/max macro conflicts on Windows
+target_compile_definitions(filesplitter PRIVATE NOMINMAX)
+
 # Link the libraries to our executable
 target_link_libraries(filesplitter PRIVATE
     cpr::cpr
     nlohmann_json::nlohmann_json
-    indicators::indicators # Link the new progress bar library
+    indicators::indicators 
     httplib::httplib
     )
 

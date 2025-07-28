@@ -5,6 +5,9 @@
 #include <httplib.h>
 #include <iostream>
 #include <windows.h>
+#include <sstream>
+#include <vector>
+
 
 void open_url_in_browser(const std::string &url) {
 #if defined(_WIN32)
@@ -17,6 +20,45 @@ void open_url_in_browser(const std::string &url) {
   std::system(command.c_str());
 }
 
+std::string decode_base64url(const std::string& input) {
+  static const std::string base64_chars =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+      "abcdefghijklmnopqrstuvwxyz"
+      "0123456789+/";
+
+  std::string base64 = input;
+  std::replace(base64.begin(), base64.end(), '-', '+');
+  std::replace(base64.begin(), base64.end(), '_', '/');
+  while (base64.length() % 4 != 0)
+      base64 += '=';
+
+  auto is_base64 = [](unsigned char c) {
+      return std::isalnum(c) || c == '+' || c == '/';
+  };
+
+  std::vector<unsigned char> bytes;
+  int val = 0, valb = -8;
+  for (unsigned char c : base64) {
+      if (!is_base64(c)) break;
+      val = (val << 6) + base64_chars.find(c);
+      valb += 6;
+      if (valb >= 0) {
+          bytes.push_back(char((val >> valb) & 0xFF));
+          valb -= 8;
+      }
+  }
+
+  return std::string(bytes.begin(), bytes.end());
+}
+std::vector<std::string> splitString(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
 // --- All authentication, find, create, update functions are correct and remain
 // unchanged. ---
 GDriveHandler::GDriveHandler(const std::string &token_path,
@@ -58,6 +100,39 @@ void GDriveHandler::ensureAuthenticated() {
     performAuthentication();
   }
 }
+std::string GDriveHandler::getAccessToken() const {
+  return m_tokens["access_token"].get<std::string>();
+}
+
+
+std::string GDriveHandler::authenticateNewAccount(const std::string& token_directory) {
+  performAuthentication(); // Triggers OAuth2.0 flow
+
+  if (!m_tokens.contains("id_token"))
+      throw std::runtime_error("ID token not found after authentication.");
+
+  std::string id_token = m_tokens["id_token"];
+  auto parts = splitString(id_token, '.'); // You'll need to implement or already have splitString()
+
+  if (parts.size() != 3)
+      throw std::runtime_error("Invalid ID token format.");
+
+  std::string payload_json = decode_base64url(parts[1]);
+  nlohmann::json payload = nlohmann::json::parse(payload_json);
+  std::string email = payload["email"];
+
+  std::filesystem::create_directories(token_directory);
+  std::string token_path = (std::filesystem::path(token_directory) / (email + ".json")).string();
+
+  std::ofstream out(token_path);
+  out << m_tokens.dump(4);
+  out.close();
+
+  m_token_path = token_path;
+
+  return email;
+}
+
 bool GDriveHandler::refreshAccessToken() {
   cpr::Response r = cpr::Post(
       cpr::Url{m_credentials["installed"]["token_uri"].get<std::string>()},
@@ -111,6 +186,33 @@ std::string GDriveHandler::createFolder(const std::string &name,
   }
   throw std::runtime_error("Failed to create folder. Response: " + r.text);
 }
+
+void GDriveHandler::shareFileOrFolder(const std::string& fileId, const std::string& emailAddress) {
+  ensureAuthenticated();
+  nlohmann::json permission = {
+      {"type", "user"},
+      {"role", "writer"},
+      {"emailAddress", emailAddress}
+  };
+
+  cpr::Response r = cpr::Post(
+      cpr::Url{"https://www.googleapis.com/drive/v3/files/" + fileId + "/permissions"},
+      cpr::Header{
+          {"Authorization", "Bearer " + m_tokens["access_token"].get<std::string>()},
+          {"Content-Type", "application/json"}
+      },
+      cpr::Parameters{{"sendNotificationEmail", "false"}},
+      cpr::Body{permission.dump()}
+  );
+
+  if (r.status_code != 200) {
+      // It's better not to throw an error here, just warn the user.
+      // The upload might still succeed.
+      std::cerr << "\nWarning: Failed to share folder " << fileId << " with " << emailAddress 
+                << ". Response: " << r.text << std::endl;
+  }
+}
+
 std::string GDriveHandler::uploadNewFile(const std::string &content,
                                          const std::string &remote_name,
                                          const std::string &parent_id) {
@@ -206,7 +308,8 @@ void GDriveHandler::performAuthentication() {
   // Detach the thread to let it run independently. It will be stopped later.
   server_thread.detach();
 
-  std::string scope = "https://www.googleapis.com/auth/drive";
+  std::string scope = "https://www.googleapis.com/auth/drive openid email";
+
   std::string client_id =
       m_credentials["installed"]["client_id"].get<std::string>();
   std::string redirect_uri = "http://localhost:8080"; // This must match
@@ -233,14 +336,16 @@ void GDriveHandler::performAuthentication() {
             << std::endl;
 
   cpr::Response r = cpr::Post(
-      cpr::Url{m_credentials["installed"]["token_uri"].get<std::string>()},
-      cpr::Payload{
-          {"code", auth_code},
-          {"client_id", client_id},
-          {"client_secret",
-           m_credentials["installed"]["client_secret"].get<std::string>()},
-          {"redirect_uri", redirect_uri},
-          {"grant_type", "authorization_code"}});
+    cpr::Url{m_credentials["installed"]["token_uri"].get<std::string>()},
+    cpr::Payload{
+        {"code", auth_code},
+        {"client_id", client_id},
+        {"client_secret",
+         m_credentials["installed"]["client_secret"].get<std::string>()},
+        {"redirect_uri", redirect_uri},
+        {"grant_type", "authorization_code"}});
+std::cout << "Response: " << r.text << std::endl; // Debugging output
+          
 
   if (r.status_code == 200) {
     m_tokens = nlohmann::json::parse(r.text);
@@ -251,7 +356,15 @@ void GDriveHandler::performAuthentication() {
   }
 }
 
-// --- CORRECTED UPLOAD/DOWNLOAD FUNCTIONS ---
+std::string GDriveHandler::extractUploadedFileId(const cpr::Response& response) {
+  auto json_response = nlohmann::json::parse(response.text);
+  if (json_response.contains("id")) {
+      return json_response["id"];
+  }
+  return "";
+}
+
+
 
 std::string
 GDriveHandler::uploadChunk(const std::string &local_file_path,
