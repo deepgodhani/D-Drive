@@ -187,31 +187,7 @@ std::string GDriveHandler::createFolder(const std::string &name,
   throw std::runtime_error("Failed to create folder. Response: " + r.text);
 }
 
-void GDriveHandler::shareFileOrFolder(const std::string& fileId, const std::string& emailAddress) {
-  ensureAuthenticated();
-  nlohmann::json permission = {
-      {"type", "user"},
-      {"role", "writer"},
-      {"emailAddress", emailAddress}
-  };
 
-  cpr::Response r = cpr::Post(
-      cpr::Url{"https://www.googleapis.com/drive/v3/files/" + fileId + "/permissions"},
-      cpr::Header{
-          {"Authorization", "Bearer " + m_tokens["access_token"].get<std::string>()},
-          {"Content-Type", "application/json"}
-      },
-      cpr::Parameters{{"sendNotificationEmail", "false"}},
-      cpr::Body{permission.dump()}
-  );
-
-  if (r.status_code != 200) {
-      // It's better not to throw an error here, just warn the user.
-      // The upload might still succeed.
-      std::cerr << "\nWarning: Failed to share folder " << fileId << " with " << emailAddress 
-                << ". Response: " << r.text << std::endl;
-  }
-}
 
 std::string GDriveHandler::uploadNewFile(const std::string &content,
                                          const std::string &remote_name,
@@ -441,5 +417,21 @@ void GDriveHandler::downloadChunk(const std::string &file_id,
   if (r.status_code != 200) {
     throw std::runtime_error("Download failed for file ID " + file_id +
                              ". Status: " + std::to_string(r.status_code));
+  }
+}
+
+
+
+void GDriveHandler::deleteFileById(const std::string& file_id) {
+  ensureAuthenticated();
+  cpr::Response r = cpr::Delete(
+      cpr::Url{"https://www.googleapis.com/drive/v3/files/" + file_id},
+      cpr::Header{{"Authorization", "Bearer " + getAccessToken()}}
+  );
+
+  // 204 No Content is the success code for a DELETE request.
+  // We can also accept 404 Not Found, in case the chunk was already deleted.
+  if (r.status_code != 204 && r.status_code != 404) {
+      throw std::runtime_error("Failed to delete file ID " + file_id + ". Status: " + std::to_string(r.status_code) + " Body: " + r.text);
   }
 }

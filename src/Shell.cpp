@@ -27,7 +27,9 @@ Shell::Shell()
         {"download", {"Download a file", [this](const auto& args) { downloadFile(args); }}},
         {"list", {"List uploaded files", [this](const auto& args) { listFiles(args); }}},
         {"accounts", {"List connected accounts", [this](const auto& args) { listAccounts(args); }}},
-        {"help", {"Show help", [this](const auto& args) { showHelp(args); }}}
+        {"help", {"Show help", [this](const auto& args) { showHelp(args); }}},
+        {"exit", {"Exit the application", [this](const auto& args) { saveMetadataOnExit(); exit(0); }}},
+        {"delete", {"Delete a file from D-Drive", [this](const auto& args) { deleteFile(args); }}}
     };
 }
 
@@ -70,33 +72,17 @@ void Shell::uploadFile(const std::string& localFilePath) {
     file.seekg(0);
     const int64_t chunkSize = 50 * 1024 * 1024;
     int totalChunks = (fileSize + chunkSize - 1) / chunkSize;
+// In Shell::uploadFile...
+std::string fileName = fs::path(localFilePath).filename().string();
+std::string metadataKey = fileName;
 
-    std::string fileName = fs::path(localFilePath).filename().string();
-    std::string metadataKey = fileName;
+if (m_local_accounts.empty()) {
+    throw std::runtime_error("No linked accounts. Use 'add-account' first.");
+}
 
-    if (m_local_accounts.empty())
-        throw std::runtime_error("No linked accounts. Use 'add-account' first.");
-    if (m_local_accounts.size() > 1 && !m_primary_gdrive) {
-        throw std::runtime_error("Primary account not set for sharing. Please restart the app.");
-    }
+// Set initial metadata
+m_metadata["files"][metadataKey]["total_size"] = fileSize;
 
-    // --- FIX FOR RACE CONDITION ---
-    // 1. Create the main folder with the primary account
-    std::string chunksParentFolder = m_primary_gdrive->createFolder("D-DriveChunks");
-    std::string fileParentFolderId = m_primary_gdrive->createFolder(fileName, chunksParentFolder);
-    m_metadata["files"][metadataKey]["parent_folder_id"] = fileParentFolderId;
-    m_metadata["files"][metadataKey]["total_size"] = fileSize;
-
-    // 2. Share this folder with all other accounts
-    if (m_local_accounts.size() > 1) {
-        for (const auto& [email, _] : m_local_accounts) {
-            // Don't need to share with the owner
-            if (email != m_primary_gdrive->getAccessToken()) {
-                 m_primary_gdrive->shareFileOrFolder(fileParentFolderId, email);
-            }
-        }
-    }
-    // --- END FIX ---
 
     std::mutex meta_mutex;
     std::mutex progress_mutex;
@@ -135,55 +121,66 @@ void Shell::uploadFile(const std::string& localFilePath) {
         std::string tokenPath = account_it->second;
 
         m_upload_slots.acquire();
-        futures.emplace_back(std::async(std::launch::async, [this, tokenPath, chunkFilePath, fileName, i, fileParentFolderId, &bar, &uploaded_bytes, &meta_mutex, &progress_mutex, &successful_chunks, account, metadataKey, &start_time] {
-            try {
-                GDriveHandler gdrive(tokenPath, m_creds_path);
-                gdrive.ensureAuthenticated();
-                
-                cpr::cpr_off_t chunk_uploaded = 0;
+       // In the for loop inside Shell::uploadFile...
+futures.emplace_back(std::async(std::launch::async, [this, tokenPath, chunkFilePath, fileName, i, &bar, &uploaded_bytes, &meta_mutex, &progress_mutex, &successful_chunks, account, metadataKey, &start_time] {
+    try {
+        GDriveHandler gdrive(tokenPath, m_creds_path);
+        gdrive.ensureAuthenticated();
+        
+        // --- NEW LOGIC: Get or create the chunk folder in THIS account ---
+        const std::string CHUNK_FOLDER_NAME = "D-Drive Chunks";
+        std::string chunkFolderId = gdrive.findFileOrFolder(CHUNK_FOLDER_NAME, "root");
 
-                std::string fileId = gdrive.uploadChunk(
-                    chunkFilePath,
-                    fileName + ".part" + std::to_string(i),
-                    fileParentFolderId, // Use the pre-created, shared folder
-                    [&](cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t now_ul, intptr_t) -> bool {
-                        cpr::cpr_off_t delta = now_ul - chunk_uploaded;
-                        chunk_uploaded = now_ul;
-                        uploaded_bytes += delta;
+        if (chunkFolderId.empty()) {
+            // This should ideally never happen if account setup was successful
+            throw std::runtime_error("Critical: 'D-Drive Chunks' folder not found for account " + account + ". Please try re-adding the account.");
+        }
 
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        auto now = std::chrono::steady_clock::now();
-                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-                        if (elapsed_seconds > 0) {
-                            double speed = (double)uploaded_bytes / elapsed_seconds;
-                            std::stringstream speed_ss;
-                            if (speed < 1024 * 1024) {
-                                speed_ss << std::fixed << std::setprecision(1) << (speed / 1024.0) << " KB/s";
-                            } else {
-                                speed_ss << std::fixed << std::setprecision(1) << (speed / (1024.0 * 1024.0)) << " MB/s";
-                            }
-                            bar.set_option(indicators::option::PostfixText{speed_ss.str()});
-                        }
-                        bar.set_progress(uploaded_bytes);
-                        return true;
-                    });
+        cpr::cpr_off_t chunk_uploaded = 0;
 
-                {
-                    std::lock_guard<std::mutex> lock(meta_mutex);
-                    m_metadata["files"][metadataKey]["chunks"].push_back({
-                        {"part", i},
-                        {"account", account},
-                        {"drive_file_id", fileId}
-                    });
-                }
-                successful_chunks++;
-                fs::remove(chunkFilePath);
-            } catch (const std::exception& e) {
+        std::string fileId = gdrive.uploadChunk(
+            chunkFilePath,
+            fileName + ".part" + std::to_string(i),
+            chunkFolderId, // Use the account-specific folder ID
+            [&](cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t, cpr::cpr_off_t now_ul, intptr_t) -> bool {
+                // ... (the progress callback logic remains exactly the same)
+                cpr::cpr_off_t delta = now_ul - chunk_uploaded;
+                chunk_uploaded = now_ul;
+                uploaded_bytes += delta;
+
                 std::lock_guard<std::mutex> lock(progress_mutex);
-                std::cerr << "\nError uploading chunk " << i << ": " << e.what() << std::endl;
-            }
-            m_upload_slots.release();
-        }));
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                if (elapsed_seconds > 0) {
+                    double speed = (double)uploaded_bytes / elapsed_seconds;
+                    std::stringstream speed_ss;
+                    if (speed < 1024 * 1024) {
+                        speed_ss << std::fixed << std::setprecision(1) << (speed / 1024.0) << " KB/s";
+                    } else {
+                        speed_ss << std::fixed << std::setprecision(1) << (speed / (1024.0 * 1024.0)) << " MB/s";
+                    }
+                    bar.set_option(indicators::option::PostfixText{speed_ss.str()});
+                }
+                bar.set_progress(uploaded_bytes);
+                return true;
+            });
+
+        {
+            std::lock_guard<std::mutex> lock(meta_mutex);
+            m_metadata["files"][metadataKey]["chunks"].push_back({
+                {"part", i},
+                {"account", account},
+                {"drive_file_id", fileId}
+            });
+        }
+        successful_chunks++;
+        fs::remove(chunkFilePath);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        std::cerr << "\nError uploading chunk " << i << ": " << e.what() << std::endl;
+    }
+    m_upload_slots.release();
+}));
     }
 
     for (auto& f : futures) {
@@ -271,10 +268,7 @@ void Shell::initializeState() {
         std::string email = file.path().stem().string();
         m_local_accounts[email] = file.path().string();
     }
-    if (!m_local_accounts.empty()) {
-        auto const& [email, path] = *m_local_accounts.begin();
-        m_primary_gdrive = std::make_unique<GDriveHandler>(path, m_creds_path);
-    }
+   
 }
 
 void Shell::saveMetadataOnExit() {
@@ -290,13 +284,36 @@ std::vector<std::string> Shell::parseCommand(const std::string& input) {
 }
 
 void Shell::addAccount(const std::vector<std::string>&) {
-    std::cout << "Adding new account...\n";
-    GDriveHandler handler("", m_creds_path);
-    auto email = handler.authenticateNewAccount("data/tokens");
-    m_local_accounts[email] = "data/tokens/" + email + ".json";
-    if (!m_primary_gdrive)
-        m_primary_gdrive = std::make_unique<GDriveHandler>(m_local_accounts[email], m_creds_path);
-    std::cout << "Account added: " << email << std::endl;
+    std::cout << "Adding new account..." << std::endl;
+    // This handler is temporary, just for the auth flow
+    GDriveHandler auth_handler("", m_creds_path);
+    std::string email = auth_handler.authenticateNewAccount("data/tokens");
+
+    std::string token_path = "data/tokens/" + email + ".json";
+    m_local_accounts[email] = token_path;
+    std::cout << "Account for " << email << " added locally." << std::endl;
+
+    // --- NEW LOGIC: SETUP FOLDER FOR THE NEW ACCOUNT ---
+    try {
+        std::cout << "Setting up storage folder in " << email << "'s Drive..." << std::endl;
+        // Create a handler for the newly added account
+        GDriveHandler new_account_gdrive(token_path, m_creds_path);
+
+        const std::string CHUNK_FOLDER_NAME = "D-Drive Chunks";
+        // Find or create the folder in the root of the new account's drive
+        std::string chunkFolderId = new_account_gdrive.findFileOrFolder(CHUNK_FOLDER_NAME, "root");
+        if (chunkFolderId.empty()) {
+            new_account_gdrive.createFolder(CHUNK_FOLDER_NAME, "root");
+            std::cout << "Created 'D-Drive Chunks' folder." << std::endl;
+        } else {
+            std::cout << "'D-Drive Chunks' folder already exists." << std::endl;
+        }
+        std::cout << "Setup complete for " << email << "!" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error during folder setup for " << email << ": " << e.what() << std::endl;
+        // Optional: decide if you want to remove the account if setup fails
+    }
 }
 
 void Shell::listAccounts(const std::vector<std::string>&) {
@@ -310,4 +327,52 @@ void Shell::showHelp(const std::vector<std::string>&) {
     for (const auto& [cmd, info] : m_commands)
         std::cout << std::setw(12) << std::left << cmd << " : " << info.description << std::endl;
     std::cout << "Type 'exit' to quit.\n";
+}
+
+void Shell::deleteFile(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        throw std::runtime_error("Usage: delete <remote_file_name>");
+    }
+    std::string remoteFileName = args[1];
+
+    if (!m_metadata["files"].contains(remoteFileName)) {
+        throw std::runtime_error("File not found in metadata: " + remoteFileName);
+    }
+
+    const auto& chunks = m_metadata["files"][remoteFileName]["chunks"];
+    std::cout << "Deleting " << remoteFileName << " (" << chunks.size() << " chunks)..." << std::endl;
+
+    std::vector<std::future<void>> futures;
+    std::atomic<int> successful_deletes = 0;
+
+    for (const auto& chunk_info : chunks) {
+        std::string account_email = chunk_info["account"];
+        std::string file_id = chunk_info["drive_file_id"];
+        std::string token_path = m_local_accounts[account_email];
+
+        futures.emplace_back(std::async(std::launch::async, [this, token_path, file_id, &successful_deletes]() {
+            try {
+                // Create a handler for the specific account for this chunk
+                GDriveHandler gdrive(token_path, m_creds_path);
+                gdrive.deleteFileById(file_id);
+                successful_deletes++;
+            } catch (const std::exception& e) {
+                // It's often okay if deletion fails (e.g., file already gone), so we just print a warning.
+                std::cerr << "\nWarning: Could not delete chunk " << file_id << ". Reason: " << e.what() << std::endl;
+            }
+        }));
+    }
+
+    // Wait for all delete operations to complete
+    for (auto& f : futures) {
+        f.get();
+    }
+
+    // After deleting all chunks, remove the file from our metadata
+    m_metadata["files"].erase(remoteFileName);
+    m_metadata_changed = true; // Mark metadata for saving on exit
+    saveMetadataOnExit(); // Save immediately for data consistency
+
+    std::cout << "Successfully deleted '" << remoteFileName << "' from D-Drive." << std::endl;
+    std::cout << successful_deletes << "/" << chunks.size() << " chunks deleted from Google Drive." << std::endl;
 }

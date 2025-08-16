@@ -44,7 +44,6 @@ private:
     // --- State Variables ---
     std::string m_creds_path;
     std::map<std::string, std::string> m_local_accounts;
-    std::unique_ptr<GDriveHandler> m_primary_gdrive;
     json m_metadata;
     bool m_metadata_changed;
     Semaphore m_upload_slots; // Semaphore as a class member
@@ -70,6 +69,7 @@ private:
     void listFiles(const std::vector<std::string>& args);
     void listAccounts(const std::vector<std::string>& args);
     void showHelp(const std::vector<std::string>& args);
+    void deleteFile(const std::vector<std::string>& args);
 };
 
 #endif // SHELL_H
