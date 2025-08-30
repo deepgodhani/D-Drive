@@ -59,8 +59,6 @@ std::vector<std::string> splitString(const std::string& s, char delimiter) {
     }
     return tokens;
 }
-// --- All authentication, find, create, update functions are correct and remain
-// unchanged. ---
 GDriveHandler::GDriveHandler(const std::string &token_path,
                              const std::string &credentials_path)
     : m_token_path(token_path) {
@@ -288,7 +286,7 @@ void GDriveHandler::performAuthentication() {
 
   std::string client_id =
       m_credentials["installed"]["client_id"].get<std::string>();
-  std::string redirect_uri = "http://localhost:8080"; // This must match
+  std::string redirect_uri = "http://localhost:8080"; 
 
   std::string auth_url =
       std::string("https://accounts.google.com/o/oauth2/v2/auth?") +
@@ -320,7 +318,8 @@ void GDriveHandler::performAuthentication() {
          m_credentials["installed"]["client_secret"].get<std::string>()},
         {"redirect_uri", redirect_uri},
         {"grant_type", "authorization_code"}});
-std::cout << "Response: " << r.text << std::endl; // Debugging output
+
+ // std::cout << "Response: " << r.text << std::endl;
           
 
   if (r.status_code == 200) {
@@ -342,48 +341,61 @@ std::string GDriveHandler::extractUploadedFileId(const cpr::Response& response) 
 
 
 
-std::string
-GDriveHandler::uploadChunk(const std::string &local_file_path,
-                           const std::string &remote_file_name,
-                           const std::string &parentFolderId,
-                           const ProgressCallback &progress_callback) {
-  ensureAuthenticated();
-  std::ifstream file(local_file_path, std::ios::binary);
-  if (!file.is_open()) {
-    throw std::runtime_error("Could not open chunk file for upload: " +
-                             local_file_path);
-  }
-  std::string content((std::istreambuf_iterator<char>(file)),
-                      std::istreambuf_iterator<char>());
-  file.close();
+std::string GDriveHandler::uploadChunk(const std::vector<char>& chunk_data,
+  const std::string& remote_file_name,
+  const std::string& parentFolderId,
+  const ProgressCallback& progress_callback) {
+ensureAuthenticated();
 
-  nlohmann::json metadata = {{"name", remote_file_name},
-                             {"parents", {parentFolderId}}};
-  cpr::Buffer file_buffer(content.begin(), content.end(),
-                          std::filesystem::path(remote_file_name));
+// 1. Initiate a resumable upload session
+std::string session_uri = initiateResumableUpload(remote_file_name, parentFolderId);
 
-  cpr::Session session;
-  session.SetUrl(cpr::Url{
-      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"});
-  session.SetHeader(
-      {{"Authorization",
-        "Bearer " + m_tokens["access_token"].get<std::string>()}});
-  session.SetMultipart(
-      {cpr::Part{"metadata", metadata.dump(),
-                 "application/json; charset=UTF-8"},
-       cpr::Part{"file", file_buffer, "application/octet-stream"}});
+// 2. Upload the file content using the session URI
+cpr::Session session;
+session.SetUrl(cpr::Url{session_uri});
+session.SetHeader({
+{"Authorization", "Bearer " + m_tokens["access_token"].get<std::string>()},
+{"Content-Type", "application/octet-stream"},
+{"Content-Length", std::to_string(chunk_data.size())}
+});
 
-  if (progress_callback) {
-    session.SetProgressCallback(progress_callback);
-  }
+session.SetBody(cpr::Body(std::string(chunk_data.begin(), chunk_data.end())));
 
-  cpr::Response r = session.Post();
-  if (r.status_code == 200) {
-    return nlohmann::json::parse(r.text)["id"];
-  } else {
-    throw std::runtime_error("Upload failed. Response: " + r.text);
-  }
+if (progress_callback) {
+session.SetProgressCallback(progress_callback);
 }
+
+cpr::Response r = session.Put();
+
+if (r.status_code == 200) {
+return nlohmann::json::parse(r.text)["id"];
+} else {
+throw std::runtime_error("Resumable upload failed. Response: " + r.text);
+}
+}
+
+std::string GDriveHandler::initiateResumableUpload(const std::string& remote_file_name, const std::string& parentFolderId) {
+  nlohmann::json metadata = {
+      {"name", remote_file_name},
+      {"parents", {parentFolderId}}
+  };
+
+  cpr::Response r = cpr::Post(
+      cpr::Url{"https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"},
+      cpr::Header{
+          {"Authorization", "Bearer " + m_tokens["access_token"].get<std::string>()},
+          {"Content-Type", "application/json; charset=UTF-8"}
+      },
+      cpr::Body{metadata.dump()}
+  );
+
+  if (r.status_code == 200) {
+      // The session URI is in the "Location" header of the response
+      return r.header["Location"];
+  } else {
+      throw std::runtime_error("Failed to initiate resumable upload. Response: " + r.text);
+  }
+} 
 
 void GDriveHandler::downloadChunk(const std::string &file_id,
                                   const std::string &save_path,
@@ -429,8 +441,6 @@ void GDriveHandler::deleteFileById(const std::string& file_id) {
       cpr::Header{{"Authorization", "Bearer " + getAccessToken()}}
   );
 
-  // 204 No Content is the success code for a DELETE request.
-  // We can also accept 404 Not Found, in case the chunk was already deleted.
   if (r.status_code != 204 && r.status_code != 404) {
       throw std::runtime_error("Failed to delete file ID " + file_id + ". Status: " + std::to_string(r.status_code) + " Body: " + r.text);
   }

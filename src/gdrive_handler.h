@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <vector> 
 #include <cpr/cpr.h>
 
 // Define a type for our progress callback function to match CPR's signature
@@ -23,7 +24,7 @@ public:
     std::string downloadFileContent(const std::string& file_id);
     std::string getAccessToken() const;
     // --- Chunk Transfer Functions (Now with Progress) ---
-    std::string uploadChunk(const std::string& local_file_path, const std::string& remote_file_name, const std::string& parentFolderId, const ProgressCallback& progress_callback = nullptr);
+    std::string uploadChunk(const std::vector<char>& chunk_data, const std::string& remote_file_name, const std::string& parentFolderId, const ProgressCallback& progress_callback = nullptr);
     void downloadChunk(const std::string& file_id, const std::string& save_path, const ProgressCallback& progress_callback = nullptr);
 
     void deleteFileById(const std::string& file_id);
@@ -35,6 +36,8 @@ private:
     bool refreshAccessToken();
     void saveTokens();
     bool loadTokens();
+
+    std::string initiateResumableUpload(const std::string& remote_file_name, const std::string& parentFolderId);
 
     std::string m_token_path;
     nlohmann::json m_credentials;
