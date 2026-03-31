@@ -1,94 +1,155 @@
-# D-Drive: A Distributed File Storage System over Google Drive
+# D-Drive — Distributed File Storage Across Multiple Google Drive Accounts
 
-D-Drive is a high-performance C++ command-line application that transforms multiple Google Drive accounts into a single, aggregated, and distributed file storage system. By intelligently splitting large files into smaller chunks and striping them across different accounts, it parallelizes transfers to dramatically increase upload and download speeds.
-
-This project was built from the ground up to explore advanced concepts in system design, concurrency, and secure API integration in C++.
+D-Drive is a C++ CLI application that aggregates free storage from multiple Google Drive accounts into one virtual drive, using parallel chunk-striping to achieve **4x–7x faster** uploads and downloads than a single account allows.
 
 ---
 
-## Key Features
+## Demo
 
-* **Distributed File Storage:** Aggregates the free storage of multiple Google Drive accounts into one massive virtual drive.
-* **High-Speed Transfers:** Utilizes multi-threading to upload and download file chunks concurrently, achieving significant speedups (e.g., **4x-7x faster**) compared to a single-stream transfer.
-* **Seamless Multi-Account Management:** A secure, built-in OAuth 2.0 flow allows users to easily add and manage multiple Google Drive accounts without ever leaving the command line.
-* **Data Integrity:** A robust JSON-based metadata system tracks every chunk, its location, and its order, ensuring that files can be reliably reassembled without corruption.
-* **Efficient Concurrency:** Employs a modern C++ semaphore-controlled thread pool to manage network operations, preventing system overload while maximizing throughput.
-* **Interactive Shell:** Provides a user-friendly CLI to manage accounts, upload files, download files, and list stored content.
+```
+$ ./filesplitter
+Welcome to D-Drive CLI
+Type 'help' to list available commands
+>> add-account
+  Opening browser for Google OAuth...
+  Account user@gmail.com added!
+>> upload /path/to/large-video.mp4
+  [===========================>      ] 72% | 48.3 MB/s | ETA: 00:12
+>> list
+  --- Uploaded Files ---
+  large-video.mp4 (8 chunks)
+>> download large-video.mp4 ./output/large-video.mp4
+  Download completed to: ./output/large-video.mp4
+```
 
----
+### Architecture Diagram
 
-## Technical Deep Dive
-
-### System Architecture
-![image](https://github.com/deepgodhani/D-Drive/assets/112933366/a7f1a300-84c4-42c2-809f-d3097b69519c)
-
-
-D-Drive operates on a simple yet powerful principle: **divide and conquer**.
-
-1.  **File Splitting:** When a user initiates an upload, the file is split into fixed-size chunks (e.g., 50MB).
-2.  **Chunk Distribution:** The application cycles through the list of authenticated Google Drive accounts, assigning each chunk to a different account.
-3.  **Parallel Upload:** A pool of worker threads is used to upload these chunks concurrently. A semaphore limits the number of active uploads to prevent rate-limiting and manage resources efficiently.
-4.  **Metadata Tracking:** As each chunk is successfully uploaded, its Google Drive File ID, the account it belongs to, and its part number are recorded in a local `metadata.json` file.
-5.  **Reconstruction:** During a download, the application reads the metadata, fetches all chunks in parallel from their respective accounts, and reassembles them in the correct order to reconstruct the original file.
-
-### Secure Authentication
-
-To avoid storing user credentials directly, D-Drive implements the **OAuth 2.0 Authorization Code Flow**.
-
-1.  When a user runs `add-account`, the application generates a unique authorization URL.
-2.  The user's default web browser is automatically opened to this URL for them to grant permission.
-3.  Upon granting permission, Google redirects the browser to a local `http://localhost:8080` address.
-4.  The application runs a lightweight, embedded HTTP server that listens for this redirect, captures the authorization code, and immediately shuts down.
-5.  This code is exchanged for a refresh token and an access token, which are then stored securely for future API calls.
-
----
-
-## Prerequisites
-
-* A C++17 compliant compiler (e.g., GCC, Clang, MSVC)
-* [CMake](https://cmake.org/download/) (version 3.10 or higher)
-* [vcpkg](https://github.com/microsoft/vcpkg) for dependency management
-
-## Dependencies
-
-This project relies on the following excellent open-source libraries, which will be automatically managed by `vcpkg`:
-
-* [**nlohmann/json**](https://github.com/nlohmann/json): For all JSON parsing and serialization.
-* [**CPR (C++ Requests)**](https://github.com/libcpr/cpr): A modern, elegant HTTP library for making API calls to Google Drive.
-* [**cpp-httplib**](https://github.com/yhirose/cpp-httplib): A single-header/file C++ HTTP/HTTPS server and client library, used for the OAuth 2.0 redirect flow.
-* [**Indicators**](https://github.com/p-ranav/indicators): For creating beautiful, interactive progress bars.
+```
+  Local File (e.g. 2 GB)
+        │
+        ▼
+  ┌─────────────┐
+  │  File Reader │  (Producer Thread)
+  │  256 MB/chunk│
+  └──────┬──────┘
+         │  Thread-Safe Queue
+   ┌─────┼─────┬─────┐
+   ▼     ▼     ▼     ▼
+[T1]  [T2]  [T3]  ...  (Consumer Threads, up to 16 concurrent)
+  │     │     │
+  ▼     ▼     ▼
+Account1 Account2 Account3  (OAuth2-authenticated Google Drive accounts)
+  │     │     │
+  └─────┴─────┘
+        │
+        ▼
+  metadata.json  (tracks file_id + account + part number for each chunk)
+```
 
 ---
 
-## Setup and Installation
+## Why I Built This
 
-### 1. Google Cloud Platform Setup
+Google's free 15 GB Drive limit fills up fast — especially for videos, backups, and large datasets. Upgrading storage costs money, but most people have several Google accounts sitting idle. D-Drive solves this by transparently pooling those accounts into a single, fast, unified storage layer — no paid plan needed. It also served as a deep dive into concurrent C++ systems programming and real-world OAuth 2.0 integration.
 
-Before you can build, you need to get your own Google Drive API credentials.
+---
 
-1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2.  Create a new project.
-3.  In the navigation menu, go to "APIs & Services" > "Enabled APIs & services" and click **"+ ENABLE APIS AND SERVICES"**.
-4.  Search for and enable the **"Google Drive API"**.
-5.  Go to "APIs & Services" > "OAuth consent screen". Choose **"External"** and fill in the required application details (app name, user support email, developer contact). You do not need to submit for verification for personal use.
-6.  Go to "APIs & Services" > "Credentials". Click **"+ CREATE CREDENTIALS"** and select **"OAuth client ID"**.
-7.  Choose **"Desktop app"** as the application type.
-8.  After creation, click the **"DOWNLOAD JSON"** button. Rename this file to `credentials.json` and place it in a `data/credentials/` directory within the project root.
+## Key Technical Highlights
 
-### 2. Building the Project
+- **Producer–consumer pipeline with a thread-safe queue:** A dedicated producer thread reads the file and pushes 256 MB chunks into a lock-free-friendly queue; up to 16 async consumer threads pull from it and upload in parallel, maximising network saturation.
+- **Semaphore-controlled concurrency:** A hand-rolled C++ semaphore (using `std::mutex` + `std::condition_variable`) caps simultaneous in-flight uploads to prevent rate-limiting and memory overload.
+- **Embedded OAuth 2.0 server:** The `add-account` flow spins up a lightweight `cpp-httplib` HTTP server on `localhost:8080` solely to capture Google's redirect code — no manual copy-paste required.
+- **Resumable uploads via Google Drive API:** Each chunk is sent through the Drive resumable upload protocol, making the transfer fault-tolerant against transient network errors.
+- **JSON metadata for reliable reassembly:** Every uploaded chunk's Drive file ID, owning account, and part number are persisted to `metadata.json`, guaranteeing bit-perfect reconstruction regardless of upload order.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | C++17 |
+| Build system | CMake 3.15+ |
+| Dependency manager | vcpkg |
+| HTTP client | [CPR (C++ Requests)](https://github.com/libcpr/cpr) |
+| HTTP server (OAuth) | [cpp-httplib](https://github.com/yhirose/cpp-httplib) |
+| JSON | [nlohmann/json](https://github.com/nlohmann/json) |
+| Progress bars | [Indicators](https://github.com/p-ranav/indicators) |
+| Cloud backend | Google Drive REST API v3 |
+| Auth | OAuth 2.0 Authorization Code Flow |
+
+---
+
+## How to Run Locally
+
+### 1. Google Cloud Setup (one-time)
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project.
+2. Enable the **Google Drive API** under *APIs & Services → Enabled APIs*.
+3. Go to *APIs & Services → OAuth consent screen*, choose **External**, and fill in the required fields.
+4. Go to *APIs & Services → Credentials → + Create Credentials → OAuth client ID*, choose **Desktop app**.
+5. Download the JSON file, rename it `credentials.json`, and place it at `data/credentials/credentials.json` inside the project root.
+
+### 2. Prerequisites
+
+- C++17 compiler (GCC 9+, Clang 10+, or MSVC 2019+)
+- [CMake](https://cmake.org/download/) ≥ 3.15
+- [vcpkg](https://github.com/microsoft/vcpkg)
+
+### 3. Build
 
 ```bash
-# Clone the repository
-git clone [https://github.com/your-username/D-Drive.git](https://github.com/your-username/D-Drive.git)
+git clone https://github.com/deepgodhani/D-Drive.git
 cd D-Drive
 
-# Install dependencies using vcpkg
-vcpkg install nlohmann-json cpr indicators httplib
+# Install dependencies
+vcpkg install nlohmann-json cpr indicators cpp-httplib
 
-# Configure the project with CMake, pointing it to the vcpkg toolchain
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[path-to-vcpkg]/scripts/buildsystems/vcpkg.cmake
+# Configure (replace <vcpkg-root> with your vcpkg installation path)
+cmake -B build -S . \
+  -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake
 
-# Build the project
-cmake --build build
+# Build
+cmake --build build --config Release
+```
 
-# The executable will be in the build/Debug or build/Release directory
+### 4. Run
+
+```bash
+./build/filesplitter          # Linux/macOS
+.\build\Release\filesplitter  # Windows
+```
+
+### 5. First-time setup
+
+```
+>> add-account        # Authenticate one or more Google accounts
+>> upload <file>      # Upload any file
+>> list               # See stored files
+>> download <name> <save_path>
+>> delete <name>
+>> help               # Full command reference
+```
+
+---
+
+## Architecture Overview
+
+D-Drive follows a **split → stripe → parallel-transfer → reassemble** pipeline:
+
+1. **Splitting:** The source file is read sequentially by a producer thread and divided into 256 MB chunks pushed onto a thread-safe queue.
+2. **Striping:** Consumer threads pop chunks from the queue and assign each to a different Google Drive account in round-robin order (chunk `i` → `accounts[i % n]`).
+3. **Parallel upload:** Up to 16 consumer threads upload concurrently; a semaphore prevents exceeding this limit. Each chunk is sent using Drive's resumable upload protocol.
+4. **Metadata persistence:** On success, each chunk's Drive file ID, account email, and part index are appended to `metadata.json`.
+5. **Download & reassembly:** All chunks are fetched in parallel, written to a temp directory, then concatenated in part-number order into the final output file.
+6. **Authentication:** Each account token is stored as `data/tokens/<email>.json` and automatically refreshed via the OAuth 2.0 token endpoint when expired.
+
+---
+
+## Known Limitations / What I'd Improve
+
+- **Metadata is local only:** `metadata.json` is stored on disk; if lost, uploaded files cannot be recovered. A future version should sync metadata to one of the Drive accounts itself.
+- **No encryption:** Chunks are stored in plaintext on Google Drive. Adding AES-256 encryption before upload would make the tool suitable for sensitive data.
+- **No partial failure recovery:** If a chunk upload fails mid-way, the whole upload is marked failed. Retry logic with exponential back-off (stubbed in `DDConfig.h`) is not yet wired into `Shell.cpp`.
+- **Round-robin only:** Chunk distribution doesn't account for remaining storage per account; adding a capacity-aware scheduler would prevent any single account from filling up.
+- **Single-machine only:** There is no server component — all metadata and tokens live on the machine running the CLI. A thin REST layer would enable multi-device access.
